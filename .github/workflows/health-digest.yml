@@ -1,0 +1,67 @@
+name: Health & Longevity Digest
+
+on:
+  schedule:
+    # 05:00 UTC every Sunday  ≈  08:00 in Israel (summer) / 07:00 (winter).
+    # GitHub cron cannot do "every 2 weeks", so this fires every Sunday and
+    # digest.py itself gates on the ISO week number (even weeks only).
+    - cron: "0 5 * * 0"
+
+  # Lets you run it by hand from the Actions tab. Set force=true to bypass
+  # the biweekly gate and send immediately (great for the first test).
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Send now, ignore the every-2-weeks gate?"
+        type: boolean
+        default: true
+
+# The job needs write access so it can commit the updated seen.json back.
+permissions:
+  contents: write
+
+# Never let two runs overlap.
+concurrency:
+  group: health-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the digest
+        env:
+          GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT:           ${{ secrets.RECIPIENT }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          # 'force' is only present on manual runs; empty on scheduled runs.
+          FORCE_RUN:           ${{ github.event.inputs.force }}
+        run: python digest.py
+
+      - name: Commit updated state (seen.json)
+        run: |
+          if [[ -n "$(git status --porcelain seen.json)" ]]; then
+            git config user.name  "health-digest-bot"
+            git config user.email "actions@github.com"
+            git add seen.json
+            git commit -m "chore: update seen.json [skip ci]"
+            # Rebase on any concurrent change, then push explicitly to the
+            # triggering branch (works even from a detached HEAD).
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "seen.json unchanged - nothing to commit."
+          fi

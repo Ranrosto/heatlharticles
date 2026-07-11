@@ -72,9 +72,13 @@ MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "2"))
 # summary is based on the WHOLE article rather than a teaser.
 MIN_FULLTEXT_CHARS = int(os.getenv("MIN_FULLTEXT_CHARS", "600"))
 
-# Anthropic model used for the Hebrew summaries. Cheap + good enough.
-# You can override with the ANTHROPIC_MODEL secret/variable if you like.
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+# Anthropic model used for the Hebrew summaries.
+# claude-opus-4-8 = the Opus flagship: strongest reasoning, best nuance on
+# scientific text. Override with the ANTHROPIC_MODEL secret if you ever want
+# a cheaper model (e.g. claude-sonnet-4-6).
+# NOTE: Opus 4.8 rejects non-default temperature/top_p/top_k with a 400 error,
+# so this script deliberately does not send them.
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 
 # A normal browser User-Agent. Some sites reject the default python UA.
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

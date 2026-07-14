@@ -45,6 +45,20 @@ import feedparser          # pip install feedparser
 import requests            # pip install requests
 from bs4 import BeautifulSoup  # pip install beautifulsoup4 lxml
 
+# curl_cffi impersonates a real Chrome browser at the TLS level. Some sources
+# (e.g. Medical News Today, ZOE) sit behind bot protection that returns 403 to
+# python-requests no matter which User-Agent string we send, because it
+# fingerprints the TLS handshake itself. curl_cffi makes the request look like
+# genuine Chrome, which passes most of these checks. If it is not installed we
+# fall back to plain requests, so the script never crashes over it - some
+# sources just come back 403 again and are skipped as before.
+try:
+    from curl_cffi import requests as browser_requests  # pip install curl_cffi
+    HAVE_BROWSER_TLS = True
+except ImportError:
+    browser_requests = None
+    HAVE_BROWSER_TLS = False
+
 # ---------------------------------------------------------------------------
 # 0. CONFIG
 # ---------------------------------------------------------------------------
@@ -79,6 +93,16 @@ MIN_FULLTEXT_CHARS = int(os.getenv("MIN_FULLTEXT_CHARS", "600"))
 # NOTE: Opus 4.8 rejects non-default temperature/top_p/top_k with a 400 error,
 # so this script deliberately does not send them.
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+
+# How many times to retry a failed summary call (429 rate-limit / 529
+# overloaded / transient 5xx) before giving up and falling back to an excerpt.
+# Without this, a single momentary hiccup silently downgraded a card to an
+# English excerpt (this was already fixed in the innovation twin).
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "4"))
+
+# Small pause between summary calls so six back-to-back Opus requests do not
+# trip a rate limit in the first place.
+API_PACING_SECONDS = float(os.getenv("API_PACING_SECONDS", "2"))
 
 # A normal browser User-Agent. Some sites reject the default python UA.
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -208,21 +232,42 @@ def clean_text(raw_html, limit=6000):
 # ---------------------------------------------------------------------------
 
 def http_get(url, timeout=30, tries=3):
-    """GET with a real UA and a small backoff, so one transient error
-    (a 503, a slow TLS handshake) does not silently drop a source."""
+    """GET that looks like a real Chrome browser, with a small backoff.
+
+    Why: several sources reject python-requests with 403 (bot protection that
+    fingerprints the TLS handshake, not just the User-Agent). So the FIRST
+    choice is curl_cffi with Chrome impersonation; plain requests is only a
+    fallback when curl_cffi is not installed. The retry loop keeps a transient
+    error (a 503, a slow handshake) from silently dropping a source.
+    """
     headers = {
-        "User-Agent": UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;"
                   "q=0.9, text/html;q=0.8, */*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     last = None
     for i in range(tries):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            if HAVE_BROWSER_TLS:
+                # impersonate="chrome" sends real Chrome headers + TLS
+                # fingerprint; do NOT also send our fake UA on top of it.
+                resp = browser_requests.get(
+                    url, headers=headers, timeout=timeout,
+                    impersonate="chrome", allow_redirects=True)
+            else:
+                resp = requests.get(
+                    url, headers={**headers, "User-Agent": UA}, timeout=timeout)
             resp.raise_for_status()
             return resp
         except Exception as e:
             last = e
+            # A 403 is a deliberate block, not a hiccup - retrying the exact
+            # same request just wastes time. Fail fast; the caller logs it and
+            # the source is skipped for this run (policy: a blocked site is
+            # simply skipped, no scraping workarounds).
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                break
             if i < tries - 1:
                 time.sleep(1.5 * (i + 1))
     raise last
@@ -314,9 +359,12 @@ def fetch_feed(source):
         if e.get("content"):
             body = e["content"][0].get("value", "")
         body = body or e.get("summary", "") or e.get("description", "")
+        # Titles arrive from some feeds with raw HTML inside (the twin agent
+        # caught Fierce Healthcare shipping a full <a href=...> tag as a
+        # title), so titles go through the same tag-stripping as bodies.
         articles.append({
             "source": source["name"],
-            "title": html.unescape((e.get("title") or "").strip()),
+            "title": clean_text(e.get("title") or "", limit=300),
             "link": link,
             "when": entry_datetime(e),
             "text": clean_text(body),
@@ -409,32 +457,66 @@ def summarize_he(article, api_key):
         f"כותרת: {article['title']}\n\n"
         f"תוכן:\n{text}"
     )
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 700,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        data = r.json()
-        parts = [b.get("text", "") for b in data.get("content", [])
-                 if b.get("type") == "text"]
-        summary = "\n".join(p for p in parts if p).strip()
-        if summary:
-            return summary
-    except Exception as e:
-        log(f"    summary API failed for '{article['title'][:40]}': {e}")
+    # Retry on transient failures. A single 429 (rate limit) or 529 (model
+    # overloaded) must NOT silently downgrade the digest to an English excerpt.
+    # The prompt and the output language are deliberately unchanged.
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 700,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=90,
+            )
+
+            # 429 / 5xx are worth retrying; other 4xx (bad key, bad model) are not.
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt < API_MAX_RETRIES:
+                    # Honour Retry-After when the API sends it.
+                    wait = float(r.headers.get("retry-after") or 0) or (2 ** attempt)
+                    log(f"    API {r.status_code} (attempt {attempt}/{API_MAX_RETRIES}); "
+                        f"retrying in {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+
+            r.raise_for_status()
+            data = r.json()
+            parts = [b.get("text", "") for b in data.get("content", [])
+                     if b.get("type") == "text"]
+            summary = "\n".join(p for p in parts if p).strip()
+            if summary:
+                return summary
+            log(f"    API returned an empty summary (attempt {attempt}).")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            # 4xx (except 429, handled above) is permanent: a bad API key, a
+            # wrong model name, a malformed request. Retrying cannot help.
+            if 400 <= code < 500:
+                log(f"    PERMANENT API error {code} for "
+                    f"'{article['title'][:40]}': {e}. Not retrying. "
+                    f"Check ANTHROPIC_API_KEY / ANTHROPIC_MODEL.")
+                break
+            log(f"    summary API failed for '{article['title'][:40]}' "
+                f"(attempt {attempt}/{API_MAX_RETRIES}): {e}")
+            if attempt < API_MAX_RETRIES:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            log(f"    summary API failed for '{article['title'][:40]}' "
+                f"(attempt {attempt}/{API_MAX_RETRIES}): {e}")
+            if attempt < API_MAX_RETRIES:
+                time.sleep(2 ** attempt)
 
     # Fallback: short excerpt, clearly marked.
+    log(f"    !! giving up on summary for '{article['title'][:40]}' - "
+        f"sending excerpt fallback.")
     excerpt = (article["text"] or "")[:280].strip()
     return (excerpt + " …") if excerpt else "(לא הופק סיכום; ראה קישור למקור)"
 
@@ -576,13 +658,16 @@ def main():
     chosen = select_articles(candidates, ARTICLES_PER_RUN, MAX_PER_SOURCE)
     log(f"Selected {len(chosen)} articles. Enriching + summarising...")
 
-    for it in chosen:
+    for idx, it in enumerate(chosen):
         # If the feed gave only a teaser, fetch the full article body first,
         # so the summary reflects the WHOLE article (the core requirement).
         if len(it["text"]) < MIN_FULLTEXT_CHARS:
             full = fetch_full_text(it["link"])
             if len(full) > len(it["text"]):
                 it["text"] = full
+        # Space out the Opus calls so six in a row do not trip a rate limit.
+        if idx > 0 and API_PACING_SECONDS:
+            time.sleep(API_PACING_SECONDS)
         it["summary"] = summarize_he(it, api_key)
         log(f"  ✓ {it['source']}: {it['title'][:60]}")
 

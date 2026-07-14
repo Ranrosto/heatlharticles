@@ -530,13 +530,20 @@ def build_email_html(items, run_date):
     cards = []
     for i, it in enumerate(items, 1):
         summary_html = html.escape(it["summary"]).replace("\n", "<br>")
+        # A quiet, honest label shown ONLY when the summary had to be written
+        # from a short teaser (full article was unreachable). Full-article
+        # cards stay exactly as before.
+        teaser_note = ""
+        if it.get("basis") == "teaser":
+            teaser_note = ('&nbsp;·&nbsp;<span style="color:#9a9186;'
+                           'font-weight:400;">מבוסס על תקציר בלבד</span>')
         cards.append(f"""
         <div style="background:#ffffff;border:1px solid #ece7df;border-radius:14px;
                     padding:20px 22px;margin:0 0 18px 0;">
           <div style="font-size:13px;color:#B8925A;font-weight:700;
                       letter-spacing:.2px;margin-bottom:6px;">
             {i}. {html.escape(it['source'])}
-            &nbsp;·&nbsp;{it['when'].strftime('%d.%m.%Y')}
+            &nbsp;·&nbsp;{it['when'].strftime('%d.%m.%Y')}{teaser_note}
           </div>
           <div style="font-size:18px;font-weight:800;line-height:1.4;
                       color:#1c1a17;margin-bottom:10px;">
@@ -581,8 +588,9 @@ def build_email_text(items, run_date):
     lines = [f"כל מה שמעניין בבריאות · {run_date.strftime('%d.%m.%Y')} · "
              f"{len(items)} כתבות", ""]
     for i, it in enumerate(items, 1):
+        basis = " · מבוסס על תקציר בלבד" if it.get("basis") == "teaser" else ""
         lines += [
-            f"{i}. [{it['source']} · {it['when'].strftime('%d.%m.%Y')}]",
+            f"{i}. [{it['source']} · {it['when'].strftime('%d.%m.%Y')}{basis}]",
             it["title"],
             it["summary"],
             it["link"],
@@ -665,11 +673,18 @@ def main():
             full = fetch_full_text(it["link"])
             if len(full) > len(it["text"]):
                 it["text"] = full
+        # Record what the summary is actually based on, so both the log and
+        # the email are honest about it: "full" when we have a substantial
+        # body (>= MIN_FULLTEXT_CHARS), "teaser" when even after trying to
+        # fetch the article page we only have a short snippet.
+        it["basis"] = "full" if len(it["text"]) >= MIN_FULLTEXT_CHARS else "teaser"
         # Space out the Opus calls so six in a row do not trip a rate limit.
         if idx > 0 and API_PACING_SECONDS:
             time.sleep(API_PACING_SECONDS)
         it["summary"] = summarize_he(it, api_key)
-        log(f"  ✓ {it['source']}: {it['title'][:60]}")
+        basis_note = ("full article" if it["basis"] == "full"
+                      else f"TEASER ONLY, {len(it['text'])} chars")
+        log(f"  ✓ {it['source']}: {it['title'][:60]} [{basis_note}]")
 
     run_date = dt.date.today()
     subject = f"כל מה שמעניין בבריאות · {run_date.strftime('%d.%m.%Y')} · {len(chosen)} כתבות"
